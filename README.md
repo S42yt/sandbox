@@ -31,6 +31,14 @@ Inside the sandbox the application can install packages, spawn services, write a
 ## Install
 
 ```
+curl -fsSL https://raw.githubusercontent.com/S42yt/sandbox/main/install.sh | sh
+```
+
+The script installs `slirp4netns` and `nftables` with the system package manager, installs a Rust toolchain via rustup if none is present, builds the release binary and places it at `/usr/local/bin/sandbox`. From a checkout, `./install.sh` builds that tree instead of cloning. `./install.sh --uninstall` removes the binary; `--prefix DIR` and `--no-deps` are available, see `--help`.
+
+Building by hand:
+
+```
 cargo install --path crates/cli
 sudo ln -s ~/.cargo/bin/sandbox /usr/local/bin/sandbox
 ```
