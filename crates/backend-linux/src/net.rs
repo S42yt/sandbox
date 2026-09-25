@@ -209,7 +209,6 @@ fn spawn_slirp(init_pid: libc::pid_t, policy: &NetworkPolicy, log: &Path) -> Res
         c"--configure".into(),
         c"--mtu=65520".into(),
         c"--enable-ipv6".into(),
-        c"--disable-dns".into(),
         c"--enable-seccomp".into(),
         CString::new(format!("--ready-fd={ready_fd}")).unwrap(),
         c"--netns-type=path".into(),

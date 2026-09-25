@@ -123,7 +123,8 @@ fn host_is_invisible() {
     e.fails("grep -q '^root:[^:*!]' /etc/shadow");
     e.fails("test -e /etc/ssh/ssh_host_rsa_key");
     e.fails("ps -eo comm | grep -q cargo");
-    e.fails("test -e /proc/kcore");
+    e.sh("if [ -e /proc/kcore ]; then [ -c /proc/kcore ] && [ ! -s /proc/kcore ]; fi");
+    e.fails("test -e /proc/sysrq-trigger && echo h > /proc/sysrq-trigger");
     assert_eq!(e.sh("ls /var/log"), "apt");
 }
 
