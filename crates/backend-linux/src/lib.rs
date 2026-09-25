@@ -12,6 +12,7 @@ mod layout;
 mod mount;
 mod net;
 mod ns;
+mod pty;
 mod rootfs;
 mod seccomp;
 mod seed;
@@ -180,6 +181,18 @@ impl SandboxBackend for LinuxBackend {
             return Err(Error::SnapshotNotFound(sb.name.clone(), snapshot.into()));
         }
         copy::remove_tree(&dir)
+    }
+
+    fn logs(&self, sb: &Sandbox) -> Result<String> {
+        let path = Layout::of(sb).log();
+        match fs::read_to_string(&path) {
+            Ok(s) => Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(Error::Io {
+                context: format!("reading {}", path.display()),
+                source: e,
+            }),
+        }
     }
 
     fn reset(&self, sb: &Sandbox) -> Result<()> {

@@ -58,8 +58,18 @@ enum Cmd {
     List,
     #[command(about = "Show the state of a sandbox")]
     Status { name: String },
-    #[command(about = "Print the configuration of a sandbox")]
-    Config { name: String },
+    #[command(about = "Print or change the configuration of a sandbox")]
+    Config {
+        name: String,
+        #[arg(
+            long,
+            value_name = "KEY=VALUE",
+            help = "Set a value, e.g. network.mode=lan or resources.memory=8G"
+        )]
+        set: Vec<String>,
+    },
+    #[command(about = "Print the supervisor log of a sandbox")]
+    Logs { name: String },
     #[command(about = "Copy a file from the host into a sandbox")]
     Put {
         name: String,
@@ -348,13 +358,27 @@ fn real_main() -> Result<i32> {
             }
         }
         Cmd::Status { name } => print_status(&store.open(&name)?, backend.as_ref())?,
-        Cmd::Config { name } => {
-            let sb = store.open(&name)?;
+        Cmd::Config { name, set } => {
+            let mut sb = store.open(&name)?;
+            if !set.is_empty() {
+                let mut text = std::fs::read_to_string(sb.config_path())?;
+                for kv in &set {
+                    let (k, v) = kv
+                        .split_once('=')
+                        .ok_or_else(|| anyhow!("invalid --set `{kv}`: expected KEY=VALUE"))?;
+                    text = sandbox_policy::set_value(&text, k, v)?;
+                }
+                std::fs::write(sb.config_path(), &text)?;
+                sb = store.open(&name)?;
+                if backend.status(&sb)?.state == RunState::Running {
+                    eprintln!("sandbox: {name} is running; the new configuration applies after a restart");
+                }
+            }
             print!("{}", sb.config.to_toml()?);
-            eprintln!(
-                "# edit {} to change it (takes effect on next start)",
-                sb.config_path().display()
-            );
+        }
+        Cmd::Logs { name } => {
+            let sb = store.open(&name)?;
+            print!("{}", backend.logs(&sb)?);
         }
         Cmd::Put {
             name,
@@ -417,7 +441,7 @@ fn main() -> ExitCode {
     match real_main() {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
-            eprintln!("sandbox: {e:#}");
+            eprintln!("sandbox: {e}");
             ExitCode::from(1)
         }
     }

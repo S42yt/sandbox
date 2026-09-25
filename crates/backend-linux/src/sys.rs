@@ -471,3 +471,12 @@ pub fn become_uid(uid: u32) -> Result<()> {
     check_i(unsafe { libc::setuid(uid) }, || "setuid".into())?;
     Ok(())
 }
+
+pub fn poll_hup(fd: &OwnedFd) -> bool {
+    let mut p = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut p, 1, 0) > 0 && p.revents & libc::POLLHUP != 0 }
+}

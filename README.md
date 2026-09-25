@@ -61,6 +61,10 @@ sudo sandbox stop test
 sudo sandbox start test
 sudo sandbox status test
 sudo sandbox list
+sudo sandbox logs test
+
+sudo sandbox config test
+sudo sandbox config test --set network.mode=lan --set resources.memory=8G
 
 sudo sandbox snapshot test clean
 sudo sandbox restore test clean
@@ -70,11 +74,11 @@ sudo sandbox destroy test
 
 `sandbox run` starts the sandbox if it is not running and leaves it running afterwards, so background processes started by the application keep going until `sandbox stop`. If the first argument of `run` is a host path starting with `./` or `../`, the file is copied into the sandbox first and executed from there; absolute paths and bare command names resolve inside the sandbox.
 
-Commands run as the sandbox's root user by default. A `sandbox` user with passwordless sudo exists as well (`--user sandbox`).
+Commands run as the sandbox's root user by default. A `sandbox` user with passwordless sudo exists as well (`--user sandbox`). Interactive commands get a pty inside the sandbox; piped input and output pass through unchanged. `put` and `get` accept files and directories.
 
 ## Configuration
 
-Every sandbox has a TOML configuration at `<home>/sandboxes/<name>/config.toml` (`sandbox config <name>` prints it). Changes take effect on the next start.
+Every sandbox has a TOML configuration at `<home>/sandboxes/<name>/config.toml`. `sandbox config <name>` prints it and `--set key=value` changes it (values are validated before they are written). Changes take effect on the next start.
 
 ```toml
 name = "test"

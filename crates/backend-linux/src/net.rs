@@ -11,6 +11,7 @@ use sandbox_policy::NetworkPolicy;
 use crate::sys::{self, Fork};
 
 pub const SLIRP_DNS: &str = "10.0.2.3";
+const SLIRP_GW6: &str = "fd00::2";
 const TAP: &str = "tap0";
 
 pub struct Network {
@@ -87,8 +88,16 @@ fn bring_up_loopback(init_pid: libc::pid_t) -> Result<()> {
     })
 }
 
-pub fn host_addresses() -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
+pub struct HostAddrs {
+    pub v4: BTreeSet<String>,
+    pub v6: BTreeSet<String>,
+}
+
+pub fn host_addresses() -> HostAddrs {
+    let mut out = HostAddrs {
+        v4: BTreeSet::new(),
+        v6: BTreeSet::new(),
+    };
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
         return out;
@@ -96,11 +105,23 @@ pub fn host_addresses() -> BTreeSet<String> {
     let mut cur = ifap;
     while !cur.is_null() {
         let ifa = unsafe { &*cur };
-        if !ifa.ifa_addr.is_null() && unsafe { (*ifa.ifa_addr).sa_family } as i32 == libc::AF_INET {
-            let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-            let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-            if !ip.is_loopback() {
-                out.insert(ip.to_string());
+        if !ifa.ifa_addr.is_null() {
+            match unsafe { (*ifa.ifa_addr).sa_family } as i32 {
+                libc::AF_INET => {
+                    let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                    let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+                    if !ip.is_loopback() {
+                        out.v4.insert(ip.to_string());
+                    }
+                }
+                libc::AF_INET6 => {
+                    let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                    let ip = std::net::Ipv6Addr::from(sin.sin6_addr.s6_addr);
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        out.v6.insert(ip.to_string());
+                    }
+                }
+                _ => {}
             }
         }
         cur = ifa.ifa_next;
@@ -109,24 +130,34 @@ pub fn host_addresses() -> BTreeSet<String> {
     out
 }
 
-pub fn ruleset(policy: &NetworkPolicy, host: &BTreeSet<String>) -> String {
-    let mut r = String::from("table inet sandbox {\n  chain output {\n    type filter hook output priority 0; policy accept;\n    oifname \"lo\" accept\n");
+pub fn ruleset(policy: &NetworkPolicy, host: &HostAddrs) -> String {
+    let mut r = String::from(
+        "table inet sandbox {\n  chain output {\n    type filter hook output priority 0; policy accept;\n    oifname \"lo\" accept\n",
+    );
     r.push_str(&format!(
         "    ip daddr {SLIRP_DNS} udp dport 53 accept\n    ip daddr {SLIRP_DNS} tcp dport 53 accept\n"
     ));
+    let v4 = "reject with icmp type admin-prohibited";
+    let v6 = "reject with icmpv6 type admin-prohibited";
     if !policy.lan {
-        r.push_str("    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, 224.0.0.0/4, 240.0.0.0/4 } reject with icmp type admin-prohibited\n");
+        r.push_str(&format!("    ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, 224.0.0.0/4, 240.0.0.0/4 }} {v4}\n"));
+        r.push_str(&format!(
+            "    ip6 daddr {{ fc00::/7, fe80::/10, ff00::/8 }} {v6}\n"
+        ));
     } else if !policy.host {
-        r.push_str("    ip daddr 10.0.2.2 reject with icmp type admin-prohibited\n");
-        if !host.is_empty() {
-            let list: Vec<&str> = host.iter().map(String::as_str).collect();
-            r.push_str(&format!(
-                "    ip daddr {{ {} }} reject with icmp type admin-prohibited\n",
-                list.join(", ")
-            ));
+        r.push_str(&format!(
+            "    ip daddr 10.0.2.2 {v4}\n    ip6 daddr {SLIRP_GW6} {v6}\n"
+        ));
+        if !host.v4.is_empty() {
+            let list: Vec<&str> = host.v4.iter().map(String::as_str).collect();
+            r.push_str(&format!("    ip daddr {{ {} }} {v4}\n", list.join(", ")));
+        }
+        if !host.v6.is_empty() {
+            let list: Vec<&str> = host.v6.iter().map(String::as_str).collect();
+            r.push_str(&format!("    ip6 daddr {{ {} }} {v6}\n", list.join(", ")));
         }
     }
-    r.push_str("    ip6 daddr ::/0 reject\n  }\n}\n");
+    r.push_str("  }\n}\n");
     r
 }
 
@@ -177,6 +208,7 @@ fn spawn_slirp(init_pid: libc::pid_t, policy: &NetworkPolicy, log: &Path) -> Res
         sys::cstr(&bin)?,
         c"--configure".into(),
         c"--mtu=65520".into(),
+        c"--enable-ipv6".into(),
         c"--disable-dns".into(),
         c"--enable-seccomp".into(),
         CString::new(format!("--ready-fd={ready_fd}")).unwrap(),
@@ -227,4 +259,48 @@ fn spawn_slirp(init_pid: libc::pid_t, policy: &NetworkPolicy, log: &Path) -> Res
         return Err(Error::Runtime("slirp4netns did not become ready".into()));
     }
     Ok(pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy(lan: bool, host: bool) -> NetworkPolicy {
+        NetworkPolicy {
+            isolated: true,
+            internet: true,
+            lan,
+            host,
+        }
+    }
+
+    fn addrs() -> HostAddrs {
+        HostAddrs {
+            v4: ["192.168.1.5".to_string()].into_iter().collect(),
+            v6: ["2001:db8::5".to_string()].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn internet_only_blocks_private_ranges() {
+        let r = ruleset(&policy(false, false), &addrs());
+        assert!(r.contains("192.168.0.0/16"));
+        assert!(r.contains("fc00::/7"));
+        assert!(!r.contains("192.168.1.5"));
+    }
+
+    #[test]
+    fn lan_without_host_blocks_host_addresses() {
+        let r = ruleset(&policy(true, false), &addrs());
+        assert!(!r.contains("192.168.0.0/16"));
+        assert!(r.contains("10.0.2.2"));
+        assert!(r.contains("192.168.1.5"));
+        assert!(r.contains("2001:db8::5"));
+    }
+
+    #[test]
+    fn dns_is_always_allowed() {
+        let r = ruleset(&policy(false, false), &addrs());
+        assert!(r.contains("10.0.2.3 udp dport 53 accept"));
+    }
 }

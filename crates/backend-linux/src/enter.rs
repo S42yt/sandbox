@@ -1,7 +1,5 @@
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -9,13 +7,14 @@ use sandbox_core::{Command, Error, IoContext, Result, Sandbox};
 use sandbox_policy::normalize_sandbox_path;
 
 use crate::cgroup::Cgroup;
+use crate::copy;
 use crate::layout::Layout;
 use crate::mount;
 use crate::ns::{self, IdMap};
 use crate::rootfs::{self, Build};
 use crate::supervisor::State;
 use crate::sys::{self, Fork};
-use crate::{caps, seccomp};
+use crate::{caps, pty, seccomp};
 
 pub struct User {
     pub name: String,
@@ -107,13 +106,16 @@ fn env_for(sb: &Sandbox, user: &User, cmd: &Command) -> Vec<CString> {
         .collect()
 }
 
-fn exec_in_sandbox(sb: &Sandbox, cmd: &Command, user_spec: &str) -> Result<()> {
+fn exec_in_sandbox(sb: &Sandbox, cmd: &Command, user_spec: &str, slave: Option<&str>) -> Result<()> {
     let user = lookup_user(user_spec)?;
     let cwd = cmd.cwd.clone().unwrap_or_else(|| PathBuf::from(&user.home));
     let envp = env_for(sb, &user, cmd);
     let argv: Vec<CString> = cmd.argv.iter().map(sys::cstr).collect::<Result<_>>()?;
     if argv.is_empty() {
         return Err(Error::Runtime("no command given".into()));
+    }
+    if let Some(path) = slave {
+        pty::attach_slave(path, user.uid)?;
     }
     seccomp::install(sb.config.security.nested_namespaces)?;
     caps::confine(sb.config.security.capabilities)?;
@@ -161,15 +163,25 @@ pub fn run(sb: &Sandbox, state: &State, cmd: &Command, user: &str) -> Result<i32
             let r = (|| -> Result<i32> {
                 cg.add_pid(sys::getpid())?;
                 nsfds.enter()?;
+                sys::become_uid(0)?;
+                let master = if pty::interactive() {
+                    Some(pty::open_master()?)
+                } else {
+                    None
+                };
                 match sys::fork()? {
                     Fork::Child => {
-                        if let Err(e) = exec_in_sandbox(sb, cmd, user) {
+                        let slave = master.as_ref().map(|m| m.slave.as_str());
+                        if let Err(e) = exec_in_sandbox(sb, cmd, user, slave) {
                             eprintln!("sandbox: {e}");
                             sys::exit(126);
                         }
                         unreachable!()
                     }
-                    Fork::Parent(pid) => sys::waitpid(pid),
+                    Fork::Parent(pid) => match master {
+                        Some(m) => pty::proxy(&m.fd, pid),
+                        None => sys::waitpid(pid),
+                    },
                 }
             })();
             match r {
@@ -205,90 +217,139 @@ fn offline_fs(sb: &Sandbox, layout: &Layout) -> Result<()> {
     mount::chroot(&layout.rootfs())
 }
 
-pub fn with_fs<F: FnOnce() -> Result<()>>(
+fn enter_or_mount(sb: &Sandbox, layout: &Layout, state: Option<&State>) -> Result<()> {
+    match state {
+        Some(s) => enter_fs(s),
+        None => offline_fs(sb, layout),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    HostToSandbox,
+    SandboxToHost,
+}
+
+fn transfer<H, S>(
     sb: &Sandbox,
     layout: &Layout,
     state: Option<&State>,
-    f: F,
-) -> Result<()> {
-    sys::run_child("file transfer", move || {
-        match state {
-            Some(s) => enter_fs(s)?,
-            None => offline_fs(sb, layout)?,
+    direction: Direction,
+    host_side: H,
+    sandbox_side: S,
+) -> Result<()>
+where
+    H: FnOnce(File) -> Result<()>,
+    S: FnOnce(File) -> Result<()>,
+{
+    let pipe = sys::pipe()?;
+    let errors = sys::pipe()?;
+    let read_end = File::from(pipe.read);
+    let write_end = File::from(pipe.write);
+    let (host_fd, sandbox_fd) = match direction {
+        Direction::HostToSandbox => (write_end, read_end),
+        Direction::SandboxToHost => (read_end, write_end),
+    };
+    let host_pid = match sys::fork()? {
+        Fork::Child => {
+            drop(sandbox_fd);
+            drop(errors.read);
+            finish(host_side(host_fd), &errors.write)
         }
-        f()
-    })
+        Fork::Parent(pid) => pid,
+    };
+    drop(host_fd);
+    let sandbox_pid = match sys::fork()? {
+        Fork::Child => {
+            drop(errors.read);
+            let r = enter_or_mount(sb, layout, state).and_then(|()| sandbox_side(sandbox_fd));
+            finish(r, &errors.write)
+        }
+        Fork::Parent(pid) => pid,
+    };
+    drop(sandbox_fd);
+    let pids = [host_pid, sandbox_pid];
+    drop(errors.write);
+    let msg = sys::read_all(&errors.read).unwrap_or_default();
+    let mut failed = false;
+    for pid in pids {
+        failed |= sys::waitpid(pid)? != 0;
+    }
+    if failed {
+        let m = String::from_utf8_lossy(&msg);
+        let first = m.lines().next().unwrap_or("transfer failed").to_string();
+        return Err(Error::Runtime(first));
+    }
+    Ok(())
 }
 
-fn copy_fd(src: &File, dst: &File) -> io::Result<()> {
-    let mut r = src;
-    let mut w = dst;
-    io::copy(&mut r, &mut w).map(drop)
+fn finish(r: Result<()>, errors: &std::os::unix::io::OwnedFd) -> ! {
+    if let Err(e) = r {
+        let _ = sys::write_all(errors, format!("{e}\n").as_bytes());
+        sys::exit(1);
+    }
+    sys::exit(0)
+}
+
+fn split_target(path: &Path) -> Result<(PathBuf, CString)> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::Runtime(format!("`{}` has no file name", path.display())))?;
+    let parent = path.parent().unwrap_or(Path::new("/")).to_path_buf();
+    Ok((parent, sys::cstr(name)?))
 }
 
 pub fn put(sb: &Sandbox, layout: &Layout, state: Option<&State>, source: &Path, dest: &Path) -> Result<()> {
     let dest = normalize_sandbox_path(dest)?;
-    let src = File::open(source).with_ctx(|| format!("opening {}", source.display()))?;
-    let meta = src.metadata().ctx("stat")?;
-    if meta.is_dir() {
-        return Err(Error::Runtime(
-            "directories are not supported yet; transfer an archive instead".into(),
-        ));
-    }
-    let mode = meta.mode() & 0o777;
-    with_fs(sb, layout, state, move || {
-        let target = if dest.is_dir() {
-            dest.join(
-                source
-                    .file_name()
-                    .ok_or_else(|| Error::Runtime("source has no file name".into()))?,
-            )
-        } else {
-            dest
-        };
-        if let Some(p) = target.parent() {
-            fs::create_dir_all(p).with_ctx(|| format!("creating {}", p.display()))?;
-        }
-        let out = File::create(&target).with_ctx(|| format!("creating {} in sandbox", target.display()))?;
-        copy_fd(&src, &out).with_ctx(|| format!("copying to {}", target.display()))?;
-        fs::set_permissions(&target, fs::Permissions::from_mode(mode)).ok();
-        Ok(())
-    })
+    let source = source
+        .canonicalize()
+        .with_ctx(|| format!("reading {}", source.display()))?;
+    let (src_parent, src_name) = split_target(&source)?;
+    let src_dir = copy::open_dir(&src_parent)?;
+    let base = source.file_name().map(|n| n.to_os_string());
+    transfer(
+        sb,
+        layout,
+        state,
+        Direction::HostToSandbox,
+        move |mut out| copy::pack(src_dir.as_raw_fd(), &src_name, &mut out),
+        move |mut input| {
+            let target = match base {
+                Some(b) if dest.is_dir() => dest.join(b),
+                _ => dest,
+            };
+            let (parent, name) = split_target(&target)?;
+            fs::create_dir_all(&parent).with_ctx(|| format!("creating {} in sandbox", parent.display()))?;
+            let parent_fd = copy::open_dir(&parent)?;
+            copy::unpack(parent_fd.as_raw_fd(), &name, &mut input)
+        },
+    )
 }
 
 pub fn get(sb: &Sandbox, layout: &Layout, state: Option<&State>, source: &Path, dest: &Path) -> Result<()> {
     let source = normalize_sandbox_path(source)?;
-    let dest = if dest.is_dir() {
-        dest.join(
-            source
-                .file_name()
-                .ok_or_else(|| Error::Runtime("source has no file name".into()))?,
-        )
-    } else {
-        dest.to_path_buf()
+    let target = match source.file_name() {
+        Some(b) if dest.is_dir() => dest.join(b),
+        _ => dest.to_path_buf(),
     };
-    let existed = dest.exists();
-    let out = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&dest)
-        .with_ctx(|| format!("opening {}", dest.display()))?;
-    let r = with_fs(sb, layout, state, move || {
-        let src = File::open(&source).with_ctx(|| format!("opening {} in sandbox", source.display()))?;
-        let meta = src.metadata().ctx("stat")?;
-        if meta.is_dir() {
-            return Err(Error::Runtime(
-                "directories are not supported yet; transfer an archive instead".into(),
-            ));
-        }
-        out.set_len(0).ctx("truncating destination")?;
-        copy_fd(&src, &out).with_ctx(|| format!("copying {}", source.display()))?;
-        let _ = out.set_permissions(fs::Permissions::from_mode(meta.mode() & 0o777));
-        Ok(())
-    });
+    let (parent, name) = split_target(&target)?;
+    let parent_fd = copy::open_dir(&parent)?;
+    let existed = fs::symlink_metadata(&target).is_ok();
+    let (src_parent, src_name) = split_target(&source)?;
+    let r = transfer(
+        sb,
+        layout,
+        state,
+        Direction::SandboxToHost,
+        move |mut input| copy::unpack(parent_fd.as_raw_fd(), &name, &mut input),
+        move |mut out| {
+            let src_dir = copy::open_dir(&src_parent)?;
+            copy::pack(src_dir.as_raw_fd(), &src_name, &mut out)
+        },
+    );
     if r.is_err() && !existed {
-        let _ = fs::remove_file(&dest);
+        let _ = fs::remove_file(&target);
+        let _ = fs::remove_dir_all(&target);
     }
     r
 }

@@ -162,4 +162,5 @@ pub trait SandboxBackend {
     fn restore(&self, sandbox: &Sandbox, snapshot: &str) -> Result<()>;
     fn delete_snapshot(&self, sandbox: &Sandbox, snapshot: &str) -> Result<()>;
     fn reset(&self, sandbox: &Sandbox) -> Result<()>;
+    fn logs(&self, sandbox: &Sandbox) -> Result<String>;
 }

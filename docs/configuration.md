@@ -2,6 +2,8 @@
 
 Location: `<home>/sandboxes/<name>/config.toml`. Unknown keys are rejected. Changes apply on the next `start`.
 
+Edit the file directly or use `sandbox config <name> --set <key>=<value>` with dotted keys (`network.mode=lan`, `resources.memory=8G`, `devices.gpu=true`, `env.LANG=C.UTF-8`). Values are parsed as booleans, numbers or TOML literals when they look like one and as strings otherwise; the result is validated before the file is written. `name` cannot be changed.
+
 ## Top level
 
 | key | type | default | meaning |

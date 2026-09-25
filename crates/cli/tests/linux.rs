@@ -259,3 +259,105 @@ fn users_and_sudo() {
         "sandbox"
     );
 }
+
+#[test]
+fn directory_transfer() {
+    let Some(e) = Env::new("dir") else { return };
+    e.ok(&["create", &e.name, "--network", "none"]);
+    let src = e.home.path().join("tree");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a.txt"), "a").unwrap();
+    std::fs::write(src.join("sub/b.txt"), "b").unwrap();
+    std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
+    std::fs::set_permissions(
+        src.join("a.txt"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+    for running in [true, false] {
+        if !running {
+            e.ok(&["stop", &e.name]);
+        }
+        let inner = if running { "/root/tree" } else { "/srv/tree" };
+        e.ok(&["put", &e.name, src.to_str().unwrap(), inner]);
+        let back = e.home.path().join(format!("back-{running}"));
+        e.ok(&["get", &e.name, inner, back.to_str().unwrap()]);
+        assert_eq!(std::fs::read_to_string(back.join("sub/b.txt")).unwrap(), "b");
+        assert_eq!(
+            std::fs::read_link(back.join("link")).unwrap().to_str().unwrap(),
+            "a.txt"
+        );
+        let mode = std::os::unix::fs::MetadataExt::mode(&std::fs::metadata(back.join("a.txt")).unwrap());
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    assert_eq!(e.sh("cat /root/tree/a.txt /srv/tree/sub/b.txt"), "ab");
+}
+
+#[test]
+fn interactive_commands_get_a_sandbox_pty() {
+    let Some(e) = Env::new("pty") else { return };
+    e.ok(&["create", &e.name, "--network", "none"]);
+    let home = e.home.path().to_str().unwrap().to_string();
+    let script = "import os, pty, sys, select\n\
+         pid, fd = pty.fork()\n\
+         if pid == 0:\n    os.execvp(sys.argv[1], sys.argv[1:])\n\
+         out = b''\n\
+         while True:\n\
+         \x20   r, _, _ = select.select([fd], [], [], 20)\n\
+         \x20   if not r: break\n\
+         \x20   try: d = os.read(fd, 4096)\n\
+         \x20   except OSError: break\n\
+         \x20   if not d: break\n\
+         \x20   out += d\n\
+         _, st = os.waitpid(pid, 0)\n\
+         sys.stdout.write(out.decode(errors='replace'))\n\
+         sys.exit(os.WEXITSTATUS(st))\n";
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .args([
+            env!("CARGO_BIN_EXE_sandbox"),
+            "--home",
+            &home,
+            "run",
+            &e.name,
+            "--user",
+            "sandbox",
+            "--",
+            "sh",
+            "-c",
+        ])
+        .arg("tty; ls -l $(tty) | cut -d' ' -f1,3,4; sudo -n id -u; exit 7")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert!(text.contains("/dev/pts/0\n"), "{text}");
+    assert!(text.contains("crw--w---- sandbox tty\n"), "{text}");
+    assert!(text.contains("\n0\n"), "{text}");
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
+fn config_set_and_logs() {
+    let Some(e) = Env::new("cfg") else { return };
+    e.ok(&["create", &e.name, "--network", "none"]);
+    let out = e.ok(&[
+        "config",
+        &e.name,
+        "--set",
+        "resources.memory=64M",
+        "--set",
+        "env.HELLO=world",
+    ]);
+    assert!(out.contains("memory = \"64M\""));
+    assert!(!e
+        .cmd(&["config", &e.name, "--set", "network.mode=wifi"])
+        .status
+        .success());
+    assert!(!e
+        .cmd(&["config", &e.name, "--set", "name=other"])
+        .status
+        .success());
+    assert_eq!(e.sh("echo $HELLO"), "world");
+    assert!(e.ok(&["logs", &e.name]).contains("ready"));
+}

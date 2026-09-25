@@ -43,6 +43,8 @@ Layers mirror the host's top-level system directories: `usr`, `etc`, `var`, `opt
 
 `reset` deletes `ovl/upper` and re-seeds it. `destroy` removes the whole directory. Snapshots copy `ovl/upper` with `cp -a --reflink=auto`, so on btrfs/xfs they are nearly free.
 
+`put` and `get` run two helper processes joined by a pipe: one stays on the host with host credentials, the other enters the sandbox's mount and user namespaces (or, for a stopped sandbox, mounts the layers privately and `chroot`s into them). The tree is streamed as a simple record format (file, symlink, directory enter/leave) built from `openat`-relative walks, so paths are resolved on the side they belong to and a symlink planted in the sandbox can never point a transfer at a host file.
+
 ## Linux runtime
 
 ### Processes
@@ -61,7 +63,9 @@ sandbox start (CLI)
 
 The order matters. Init performs every mount while it still holds host privileges inside namespaces that belong to the initial user namespace; only then does it enter the sandbox user namespace. Consequently the sandbox's mount, pid, net, ipc, uts and cgroup namespaces are all owned by the initial user namespace, and nothing inside the sandbox holds `CAP_SYS_ADMIN` over them: no umount, no new mounts, no sysctl writes, no network reconfiguration.
 
-`sandbox run` opens `/proc/<init>/ns/*` from the host, moves the new process into the sandbox cgroup, `setns()` into mount, pid, net, ipc, uts and cgroup namespaces, then into the user namespace, installs the same seccomp filter and capability set, switches to the requested user and `execve()`s. The command inherits the caller's terminal.
+`sandbox run` opens `/proc/<init>/ns/*` from the host, moves the new process into the sandbox cgroup, `setns()` into mount, pid, net, ipc, uts and cgroup namespaces, then into the user namespace, installs the same seccomp filter and capability set, switches to the requested user and `execve()`s. When stdin and stdout are a terminal, a pty is allocated from the sandbox's private `devpts`; the command runs on its slave (owned by the target user, group `tty`) and the host-side process relays bytes in raw mode and forwards window-size changes. Pipes are passed through unchanged.
+
+Init watches a pipe held by the supervisor; if the supervisor disappears, init kills everything in its pid namespace and exits. A supervisor that starts finds and kills any processes left in the sandbox's cgroup by a previous run.
 
 Stopping sends `SIGTERM` to the supervisor, which forwards it to init. Init signals everything in its pid namespace and exits; the kernel then kills every remaining process of the pid namespace, the supervisor kills what is left in the cgroup, tears down slirp4netns and removes the cgroup. `run/lock` is held with `flock` by the supervisor for as long as the sandbox runs, so state detection never depends on pid reuse.
 
@@ -93,8 +97,8 @@ Runtime mounts: tmpfs `/run` and `/dev` (with `null`, `zero`, `full`, `random`, 
 | mode | implementation |
 |------|----------------|
 | `none` | private network namespace with only `lo` |
-| `internet` | slirp4netns user-mode networking; nftables rules inside the namespace reject RFC1918, link-local and multicast destinations; the host loopback gateway is disabled |
-| `lan` | as above without the private-range rule; the host's own addresses and the gateway are rejected |
+| `internet` | slirp4netns user-mode networking (IPv4 and IPv6); nftables rules inside the namespace reject RFC1918, ULA, link-local and multicast destinations; the host loopback gateway is disabled |
+| `lan` | as above without the private-range rules; the host's own addresses and the gateways are rejected |
 | `host` | slirp4netns with host loopback enabled |
 | `full` | no network namespace at all; the host stack is shared |
 

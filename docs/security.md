@@ -32,7 +32,8 @@ Out of scope: kernel, hypervisor, firmware or hardware vulnerabilities; side cha
 * `mount`, `umount`, `unshare` (user, mount, pid), `mknod`, sysctl writes, `setns` into pid 1 and `setuid` to an unmapped id all fail
 * the capability bounding set and seccomp mode are exactly as configured
 * fork bombs stop at `pids.max` and large allocations are OOM-killed at `memory.max`
-* symlinks planted inside the sandbox cannot redirect `put`/`get` to host paths
+* symlinks planted inside the sandbox cannot redirect `put`/`get` to host paths, and directory transfers preserve modes and symlinks in both directions
+* interactive commands run on a pty owned by the requested user inside the sandbox, and `sudo` works on it
 * stopping a sandbox kills every process it started
 * `none` mode has only `lo` and no DNS; `internet` mode reaches the internet but not `10.0.2.2` or private ranges
 
@@ -44,6 +45,5 @@ Out of scope: kernel, hypervisor, firmware or hardware vulnerabilities; side cha
 * **Devices are bind mounts.** GPU and other device nodes are the real host devices; a driver vulnerability is reachable when they are enabled. `controllers = true` exposes `/dev/input`, which includes keyboards.
 * **Display sockets** (`display = true`) give the sandbox an X11/Wayland connection with the usual X11 caveats (input snooping between clients of the same server). Prefer a nested compositor.
 * **`/etc` masking is a denylist.** Unusual secret locations under `/etc` may be exposed read-only; put them in `[[filesystem.share]]`-style reviews or extend `ETC_DENY` in `seed.rs`. `/var` is allowlisted and `/usr`, `/opt` are shown entirely.
-* **Terminal.** `sandbox run` passes the caller's tty through instead of allocating a pty inside the sandbox; the sandbox can therefore write escape sequences to the host terminal. Do not run untrusted output in a terminal that interprets dangerous sequences without protection.
+* **Terminal output is still terminal output.** Interactive commands get a pty that lives in the sandbox's own `devpts`, and the host side only relays bytes, but a malicious program can still print escape sequences that your terminal emulator interprets. Use a terminal that guards against dangerous sequences.
 * **cgroup v1 hosts** do not get a cgroup filesystem inside the sandbox.
-* **IPv6** is not routed (slirp4netns is started IPv4-only and IPv6 output is rejected).

@@ -454,6 +454,53 @@ impl SandboxConfig {
     }
 }
 
+pub fn set_value(text: &str, key: &str, value: &str) -> Result<String> {
+    let mut table: toml::Table = toml::from_str(text)?;
+    let parts: Vec<&str> = key.split('.').collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return Err(PolicyError::Invalid(format!("invalid key `{key}`")));
+    }
+    if parts[0] == "name" {
+        return Err(PolicyError::Invalid(
+            "the name of a sandbox cannot be changed".into(),
+        ));
+    }
+    let mut cur = &mut table;
+    for p in &parts[..parts.len() - 1] {
+        cur = cur
+            .entry(*p)
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| PolicyError::Invalid(format!("`{p}` in `{key}` is not a table")))?;
+    }
+    cur.insert(parts[parts.len() - 1].to_string(), parse_value(value));
+    let out = toml::to_string_pretty(&table)?;
+    SandboxConfig::from_toml(&out)?;
+    Ok(out)
+}
+
+fn parse_value(s: &str) -> toml::Value {
+    match s {
+        "true" => return toml::Value::Boolean(true),
+        "false" => return toml::Value::Boolean(false),
+        _ => {}
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return toml::Value::Integer(i);
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return toml::Value::Float(f);
+    }
+    if s.starts_with('[') || s.starts_with('"') || s.starts_with('{') {
+        if let Ok(t) = toml::from_str::<toml::Table>(&format!("v = {s}")) {
+            if let Some(v) = t.get("v") {
+                return v.clone();
+            }
+        }
+    }
+    toml::Value::String(s.to_string())
+}
+
 const RESERVED: &[&str] = &[
     "/proc", "/sys", "/dev", "/usr", "/etc", "/bin", "/sbin", "/lib", "/lib64", "/run",
 ];
@@ -565,6 +612,26 @@ cpus = 8
             readonly: true,
         });
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn set_value_edits_and_validates() {
+        let base = SandboxConfig::new("s").to_toml().unwrap();
+        let t = set_value(&base, "network.mode", "lan").unwrap();
+        let cfg = SandboxConfig::from_toml(&t).unwrap();
+        assert_eq!(cfg.network.mode, Some(NetworkMode::Lan));
+        let t = set_value(&t, "resources.memory", "8G").unwrap();
+        let t = set_value(&t, "resources.cpus", "2").unwrap();
+        let t = set_value(&t, "devices.gpu", "true").unwrap();
+        let t = set_value(&t, "env.FOO", "bar baz").unwrap();
+        let cfg = SandboxConfig::from_toml(&t).unwrap();
+        assert_eq!(cfg.resources.memory, Some(ByteSize(8 << 30)));
+        assert_eq!(cfg.resources.cpus, Some(2.0));
+        assert!(cfg.devices.gpu);
+        assert_eq!(cfg.env["FOO"], "bar baz");
+        assert!(set_value(&t, "network.mode", "wifi").is_err());
+        assert!(set_value(&t, "network.bogus", "1").is_err());
+        assert!(set_value(&t, "name", "other").is_err());
     }
 
     #[test]

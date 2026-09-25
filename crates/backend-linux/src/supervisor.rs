@@ -215,6 +215,11 @@ fn supervise(sb: &Sandbox, layout: &Layout, store_root: &Path, ready: &OwnedFd) 
     };
     let template_fd = template.as_ref().map(|f| f.as_raw_fd());
 
+    let stale = Cgroup::open(&sb.name);
+    if !stale.procs().is_empty() {
+        log("killing processes left over from a previous run");
+        stale.kill_all();
+    }
     let cg = Cgroup::create(&sb.name, &sb.config.resources)?;
     let result = run_sandbox(
         sb,
@@ -258,7 +263,7 @@ fn run_sandbox(
     })?;
 
     let init_ready = sys::pipe()?;
-    let init_pid = launch(sb, layout, map, cg, policy, &init_ready.write)?;
+    let (init_pid, _liveness) = launch(sb, layout, map, cg, policy, &init_ready.write)?;
     drop(init_ready.write);
     log(&format!("init pid {init_pid}"));
 
@@ -351,7 +356,7 @@ fn launch(
     cg: &Cgroup,
     policy: &sandbox_policy::NetworkPolicy,
     init_ready: &OwnedFd,
-) -> Result<libc::pid_t> {
+) -> Result<(libc::pid_t, OwnedFd)> {
     let to_sup = sys::pipe()?;
     let to_init = sys::pipe()?;
     let mut flags = libc::CLONE_NEWNS
@@ -371,7 +376,9 @@ fn launch(
                 sys::unshare(flags)?;
                 mount::make_private_root()?;
                 match sys::fork()? {
-                    Fork::Child => init_main(sb, layout, policy, &to_sup.write, &to_init.read, init_ready),
+                    Fork::Child => {
+                        init_main(sb, layout, map, policy, &to_sup.write, &to_init.read, init_ready)
+                    }
                     Fork::Parent(pid) => sys::write_all(&to_sup.write, &pid.to_ne_bytes()),
                 }
             })();
@@ -406,7 +413,7 @@ fn launch(
             }
             ns::write_maps(init_pid, map)?;
             sys::write_all(&to_init.write, b"g")?;
-            Ok(init_pid)
+            Ok((init_pid, to_init.write))
         }
     }
 }
@@ -414,12 +421,13 @@ fn launch(
 fn init_main(
     sb: &Sandbox,
     layout: &Layout,
+    map: IdMap,
     policy: &sandbox_policy::NetworkPolicy,
     to_sup: &OwnedFd,
     from_sup: &OwnedFd,
     ready: &OwnedFd,
 ) -> Result<()> {
-    let r = init_setup(sb, layout, policy).and_then(|()| {
+    let r = init_setup(sb, layout, map, policy).and_then(|()| {
         sys::unshare(libc::CLONE_NEWUSER)?;
         sys::write_all(to_sup, b"u")?;
         if sys::read_byte(from_sup)? != Some(b'g') {
@@ -434,10 +442,15 @@ fn init_main(
         sys::exit(1);
     }
     sys::write_all(ready, b"1")?;
-    init_loop()
+    init_loop(from_sup)
 }
 
-fn init_setup(sb: &Sandbox, layout: &Layout, policy: &sandbox_policy::NetworkPolicy) -> Result<()> {
+fn init_setup(
+    sb: &Sandbox,
+    layout: &Layout,
+    map: IdMap,
+    policy: &sandbox_policy::NetworkPolicy,
+) -> Result<()> {
     let _ = sys::setsid();
     sys::sethostname(&sb.name)?;
     let rootfs = layout.rootfs();
@@ -468,14 +481,17 @@ fn init_setup(sb: &Sandbox, layout: &Layout, policy: &sandbox_policy::NetworkPol
         &rootfs.join("dev/pts"),
         "devpts",
         libc::MS_NOSUID | libc::MS_NOEXEC,
-        Some("newinstance,ptmxmode=0666,mode=0620,gid=5"),
+        Some(&format!(
+            "newinstance,ptmxmode=0666,mode=0620,gid={}",
+            map.host_uid(5)
+        )),
     )?;
     mount::mount(
         "tmpfs",
         &rootfs.join("dev/shm"),
         "tmpfs",
         STD_NOEXEC,
-        Some("mode=1777"),
+        Some(&format!("mode=1777,uid={0},gid={0}", map.host_uid(0))),
     )?;
     let _ = mount::mount("mqueue", &rootfs.join("dev/mqueue"), "mqueue", STD_NOEXEC, None);
     mount::pivot_into(&rootfs)?;
@@ -487,7 +503,7 @@ fn init_setup(sb: &Sandbox, layout: &Layout, policy: &sandbox_policy::NetworkPol
     Ok(())
 }
 
-fn init_loop() -> Result<()> {
+fn init_loop(supervisor: &OwnedFd) -> Result<()> {
     let sigs = sys::block_signals(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGCHLD])?;
     let mut stopping: Option<Instant> = None;
     loop {
@@ -498,6 +514,10 @@ fn init_loop() -> Result<()> {
                 sys::kill(-1, libc::SIGTERM);
             }
             _ => {}
+        }
+        if sys::poll_hup(supervisor) {
+            sys::kill(-1, libc::SIGKILL);
+            sys::exit(0);
         }
         if let Some(t) = stopping {
             sys::reap_any();
