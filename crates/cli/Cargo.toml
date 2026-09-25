@@ -1,0 +1,24 @@
+[package]
+name = "sandbox-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sandbox"
+path = "src/main.rs"
+
+[dependencies]
+sandbox-core.workspace = true
+sandbox-policy.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+anyhow.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sandbox-backend-linux.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc.workspace = true
