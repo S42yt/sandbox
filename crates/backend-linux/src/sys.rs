@@ -349,7 +349,7 @@ pub fn unblock_all_signals() {
 
 pub fn wait_signal(set: &libc::sigset_t, timeout: Option<Duration>) -> Option<libc::c_int> {
     let ts = timeout.map(|t| libc::timespec {
-        tv_sec: t.as_secs() as libc::time_t,
+        tv_sec: t.as_secs() as _,
         tv_nsec: t.subsec_nanos() as libc::c_long,
     });
     let r = unsafe {

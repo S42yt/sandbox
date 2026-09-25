@@ -34,7 +34,9 @@ Inside the sandbox the application can install packages, spawn services, write a
 curl -fsSL https://raw.githubusercontent.com/S42yt/sandbox/main/install.sh | sh
 ```
 
-The script installs `slirp4netns` and `nftables` with the system package manager, installs a Rust toolchain via rustup if none is present, builds the release binary and places it at `/usr/local/bin/sandbox`. From a checkout, `./install.sh` builds that tree instead of cloning. `./install.sh --uninstall` removes the binary; `--prefix DIR` and `--no-deps` are available, see `--help`.
+The script installs `slirp4netns` and `nftables` with the system package manager, downloads the static binary for your architecture from the latest [release](https://github.com/S42yt/sandbox/releases) (verifying its checksum) and places it at `/usr/local/bin/sandbox` together with shell completions. When no release is available, or with `--source`, it builds from source (installing a Rust toolchain via rustup if needed); from a checkout, `./install.sh` builds that tree. `./install.sh --uninstall` removes the binary; `--version TAG`, `--prefix DIR` and `--no-deps` are available, see `--help`.
+
+Releases are built as static musl binaries for `x86_64` and `aarch64` by the `release` workflow whenever a `v*` tag is pushed.
 
 Building by hand:
 
@@ -65,6 +67,8 @@ sudo sandbox logs test
 
 sudo sandbox config test
 sudo sandbox config test --set network.mode=lan --set resources.memory=8G
+
+sandbox completions bash > /etc/bash_completion.d/sandbox
 
 sudo sandbox snapshot test clean
 sudo sandbox restore test clean

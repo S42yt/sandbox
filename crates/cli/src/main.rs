@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use sandbox_core::{Command as SandboxCommand, RunState, Sandbox, SandboxBackend, Store};
 use sandbox_policy::{ByteSize, NetworkConfig, NetworkMode, SandboxConfig, Share};
 
@@ -95,6 +95,8 @@ enum Cmd {
     Reset { name: String },
     #[command(about = "Stop a sandbox and delete everything it owns")]
     Destroy { name: String },
+    #[command(about = "Print a shell completion script (bash, zsh, fish, elvish, powershell)")]
+    Completions { shell: clap_complete::Shell },
 }
 
 #[derive(Args)]
@@ -297,6 +299,10 @@ fn print_status(sb: &Sandbox, backend: &dyn SandboxBackend) -> Result<()> {
 
 fn real_main() -> Result<i32> {
     let cli = Cli::parse();
+    if let Cmd::Completions { shell } = cli.cmd {
+        clap_complete::generate(shell, &mut Cli::command(), "sandbox", &mut std::io::stdout());
+        return Ok(0);
+    }
     let store = match cli.home {
         Some(h) => Store::new(h),
         None => Store::from_env()?,
@@ -433,6 +439,7 @@ fn real_main() -> Result<i32> {
             backend.destroy(&sb)?;
             println!("destroyed sandbox {name}");
         }
+        Cmd::Completions { .. } => unreachable!(),
     }
     Ok(0)
 }

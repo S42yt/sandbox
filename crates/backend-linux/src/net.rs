@@ -74,14 +74,14 @@ fn bring_up_loopback(init_pid: libc::pid_t) -> Result<()> {
             req.ifr_name[i] = *b as libc::c_char;
         }
         sys::check_i(
-            unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS, &mut req) },
+            unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut req) },
             || "SIOCGIFFLAGS lo".into(),
         )?;
         unsafe {
             req.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
         }
         sys::check_i(
-            unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS, &req) },
+            unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS as _, &req) },
             || "SIOCSIFFLAGS lo".into(),
         )?;
         Ok(())
